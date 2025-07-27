@@ -7,7 +7,7 @@ RUN apk add --no-cache go
 COPY main.go /app/main.go
 
 # (Optional) rename the module path to sqlite-backup-s3
-RUN go mod init github.com/itbm/sqlite-backup-s3 \
+RUN go mod init github.com/mattcoulter7/sqlite-backup-s3 \
     && go get github.com/robfig/cron/v3 \
     && go build -o out/go-cron
 
