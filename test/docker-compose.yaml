@@ -27,6 +27,7 @@ services:
       DRY_RUN: no
       SQLITE_DB_ROOT_DIR: /data
       INCLUDE_SUB_DIR: "yes"                 # yes|true|1 to recurse, else top-level only
+      INCLUDE_NON_SQL_ASSETS: "yes"                 # yes|true|1 to include non database files
       SQLITE_EXTS: "sqlite,db,sqlite3,sq3"  # optional; defaults shown
 
       # --- S3 / MinIO ---
