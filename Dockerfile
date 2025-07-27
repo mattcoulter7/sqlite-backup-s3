@@ -39,7 +39,7 @@ ENV COMPRESSION_CMD 'gzip -c'
 # Scripts
 ADD run.sh run.sh
 ADD backup.sh backup.sh
-
+RUN sed -i 's/\r$//' run.sh backup.sh
 RUN chmod +x run.sh backup.sh
 
 CMD ["sh", "run.sh"]
