@@ -10,17 +10,18 @@ elog() { >&2 echo "$@"; }
 
 elog "-----"
 
-# --- Validate S3 env (only strictly needed when not in dry-run) ---
-if [ -z "${DRY_RUN:-}" ] || printf '%s' "$DRY_RUN" | tr '[:upper:]' '[:lower:]' | grep -Eq '^(yes|true|1)$'; then
+# --- DRY-RUN toggle (explicit only) ---
+if printf '%s' "${DRY_RUN:-}" | tr '[:upper:]' '[:lower:]' | grep -Eq '^(yes|true|1)$'; then
   DRY=1
 else
   DRY=0
 fi
 
+# --- Validate S3 env (only when NOT dry-run) ---
 if [ "$DRY" -eq 0 ]; then
-  [ -n "${S3_ACCESS_KEY_ID:-}" ] && [ "${S3_ACCESS_KEY_ID}" != "**None**" ] || { echo "Need S3_ACCESS_KEY_ID"; exit 1; }
-  [ -n "${S3_SECRET_ACCESS_KEY:-}" ] && [ "${S3_SECRET_ACCESS_KEY}" != "**None**" ] || { echo "Need S3_SECRET_ACCESS_KEY"; exit 1; }
-  [ -n "${S3_BUCKET:-}" ] && [ "${S3_BUCKET}" != "**None**" ] || { echo "Need S3_BUCKET"; exit 1; }
+  [ -n "${S3_ACCESS_KEY_ID:-}" ]   || { echo "Need S3_ACCESS_KEY_ID"; exit 1; }
+  [ -n "${S3_SECRET_ACCESS_KEY:-}" ] || { echo "Need S3_SECRET_ACCESS_KEY"; exit 1; }
+  [ -n "${S3_BUCKET:-}" ]          || { echo "Need S3_BUCKET"; exit 1; }
 fi
 
 # At least one source
@@ -32,7 +33,7 @@ fi
 command -v sqlite3 >/dev/null 2>&1 || { echo "sqlite3 not installed in image"; exit 1; }
 
 # --- AWS/MinIO config ---
-if [ -z "${S3_ENDPOINT:-}" ] || [ "${S3_ENDPOINT}" = "**None**" ]; then AWS_ARGS=""; else AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"; fi
+if [ -n "${S3_ENDPOINT:-}" ]; then AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"; else AWS_ARGS=""; fi
 export AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:-}"
 export AWS_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-}"
 export AWS_DEFAULT_REGION="${S3_REGION:-}"
@@ -158,19 +159,15 @@ backup_one() {
   fi
 
   DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
-  # Predict resulting object name based on env (for dry-run display)
-  if [ -n "${COMPRESSION_CMD:-}" ]; then
-    DEST_KEY_BASE="${DEST_KEY_BASE}.gz"
-  fi
-  if [ "${ENCRYPTION_PASSWORD:-**None**}" != "**None**" ] && [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
-    DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
-  fi
-  OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
 
   if [ "$DRY" -eq 1 ]; then
+    # Predict resulting object name
+    _k="$DEST_KEY_BASE"
+    [ -n "${COMPRESSION_CMD:-}" ] && _k="${_k}.gz"
+    [ -n "${ENCRYPTION_PASSWORD:-}" ] && _k="${_k}.enc"
     echo "→ DRY-RUN: would BACKUP: $SRC_PATH"
-    echo "           would Upload -> s3://${S3_BUCKET}/${OBJ_KEY}"
-    count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_KEY_BASE}\n"
+    echo "           would Upload -> s3://${S3_BUCKET}/${RUN_PREFIX%/}/${_k}"
+    count_ok=$((count_ok+1)); list_ok="${list_ok}${_k}\n"
     return 0
   fi
 
@@ -195,9 +192,10 @@ backup_one() {
       rm -f "$TMP_FILE"; return 1
     fi
     rm -f "$TMP_FILE"
+    DEST_KEY_BASE="${DEST_KEY_BASE}.gz"
   fi
 
-  if [ "${ENCRYPTION_PASSWORD:-**None**}" != "**None**" ] && [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
+  if [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
     if ! openssl enc -aes-256-cbc -in "$OUT_FILE" -out "${OUT_FILE}.enc" -k "$ENCRYPTION_PASSWORD"; then
       echo "FAIL (encrypt): $SRC_PATH"
       count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
@@ -205,6 +203,7 @@ backup_one() {
     fi
     rm -f "$OUT_FILE"
     OUT_FILE="${OUT_FILE}.enc"
+    DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
   fi
 
   # Ensure bucket exists (best-effort)
@@ -216,6 +215,7 @@ backup_one() {
     fi
   fi
 
+  OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
   echo "   Upload -> s3://${S3_BUCKET}/${OBJ_KEY}"
   if ! cat "$OUT_FILE" | aws $AWS_ARGS s3 cp - "s3://${S3_BUCKET}/${OBJ_KEY}"; then
     echo "FAIL (upload): $SRC_PATH"
@@ -239,11 +239,11 @@ EOF
 
 # --- Optional retention (skip in dry-run) ---
 if [ "$DRY" -eq 1 ]; then
-  if [ "${DELETE_OLDER_THAN:-**None**}" != "**None**" ] && [ -n "${DELETE_OLDER_THAN:-}" ]; then
+  if [ -n "${DELETE_OLDER_THAN:-}" ]; then
     echo "DRY-RUN: would check/delete objects older than ${DELETE_OLDER_THAN} under s3://${S3_BUCKET}/${S3_PREFIX%/}/"
   fi
 else
-  if [ "${DELETE_OLDER_THAN:-**None**}" != "**None**" ] && [ -n "${DELETE_OLDER_THAN:-}" ]; then
+  if [ -n "${DELETE_OLDER_THAN:-}" ]; then
     elog "Checking for files older than ${DELETE_OLDER_THAN}"
     aws $AWS_ARGS s3 ls "s3://${S3_BUCKET}/${S3_PREFIX%/}/" --recursive | while read -r line; do
       fileName=$(echo "$line" | awk '{print $4}')
