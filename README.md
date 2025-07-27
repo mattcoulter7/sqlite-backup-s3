@@ -155,3 +155,43 @@ To disable compression:
 ```sh
 -e COMPRESSION_CMD=""
 ```
+
+---
+
+## Local Test
+
+```shell
+cd test
+docker compose up --build
+```
+
+
+The first time it runs, you should see an output like
+
+```shell
+sqlite-backup-1  | [2025-07-27 14:01:50] INFO: Cron job scheduled: * * * * *
+sqlite-backup-1  | [2025-07-27 14:01:50] INFO: Command to run: /bin/sh backup.sh
+sqlite-backup-1  | [2025-07-27 14:02:00] INFO: Executing command: /bin/sh [backup.sh]                                                                                             
+sqlite-backup-1  | [2025-07-27 14:02:00] STDERR: -----
+sqlite-backup-1  | [2025-07-27 14:02:00] STDOUT: Creating SQLite backup of /data/test.sqlite...                                                                                   
+sqlite-backup-1  | [2025-07-27 14:02:00] STDOUT: Compressing backup (gzip -c)...                                                                                                  
+sqlite-backup-1  | [2025-07-27 14:02:00] STDOUT: Uploading backup to s3://app-backups/sqlite/test_2025-07-27T04:02:00Z.sqlite.gz
+sqlite-backup-1  | [2025-07-27 14:02:00] STDERR: upload failed: - to s3://app-backups/sqlite/test_2025-07-27T04:02:00Z.sqlite.gz An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist
+```
+
+Manually create the bucket `app-backups` in `localhost:9001`
+
+On the next run you should see
+
+```
+sqlite-backup-1  | [2025-07-27 14:10:22] INFO: Cron job scheduled: * * * * *
+sqlite-backup-1  | [2025-07-27 14:10:22] INFO: Command to run: /bin/sh backup.sh
+sqlite-backup-1  | [2025-07-27 14:11:00] INFO: Executing command: /bin/sh [backup.sh]
+sqlite-backup-1  | [2025-07-27 14:11:00] STDERR: -----
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: Creating SQLite backup of /data/test.sqlite...                                                                                   
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: Compressing backup (gzip -c)...                                                                                                  
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: Uploading backup to s3://app-backups/sqlite/test_2025-07-27T04:11:00Z.sqlite.gz
+sqlite-backup-1  | [2025-07-27 14:11:00] STDERR: -----                                                                                                                            
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: SQLite backup finished
+sqlite-backup-1  | [2025-07-27 14:11:00] INFO: Command finished successfully
+```
