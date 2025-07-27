@@ -191,6 +191,7 @@ spec:
 | `SQLITE_DB_PATHS`         |               | ✅\*      | **One or many** absolute file paths; semicolon **`;`** or newline‑separated. *(Required unless `SQLITE_DB_ROOT_DIR` is used.)* |
 | `SQLITE_DB_ROOT_DIR`      |               | ✅\*      | Root directory to scan for files. *(Required unless `SQLITE_DB_PATHS` is used.)*                                               |
 | `INCLUDE_SUB_DIR`         | `no`          |          | If `yes`/`true`/`1`, recurses into subdirectories.                                                                             |
+| `INCLUDE_NON_SQL_ASSETS`  | `no`          |          | If `yes`/`true`/`1`, includes non sql assets from root directory in the backup.                                                |
 | `SQLITE_EXTS`             | *(unset)*     |          | Optional allow‑list of extensions (e.g. `sqlite,sqlite3,db`). If unset/empty, **no extension filter** is applied.              |
 | `DRY_RUN`                 | `no`          |          | If `yes`/`true`/`1`, prints plan + validation only (no dump/compress/encrypt/upload/retention).                                |
 | `S3_ACCESS_KEY_ID`        |               | ✅†       | S3 access key. †Required for real runs (not required in dry‑run).                                                              |

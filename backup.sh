@@ -1,6 +1,7 @@
 #! /bin/sh
 # SQLite -> S3 backup: explicit files and/or directory scan, preserves structure under timestamped folder
 # DRY_RUN: set to yes/true/1 to only plan & validate (no backup, no upload, no retention)
+# INCLUDE_NON_SQL_ASSETS: yes|true|1 to also back up non-SQLite/filtered files under SQLITE_DB_ROOT_DIR as "assets"
 
 set -e
 (set -o pipefail) 2>/dev/null || true
@@ -17,11 +18,18 @@ else
   DRY=0
 fi
 
+# --- Include assets toggle ---
+if printf '%s' "${INCLUDE_NON_SQL_ASSETS:-}" | tr '[:upper:]' '[:lower:]' | grep -Eq '^(yes|true|1)$'; then
+  INCLUDE_ASSETS=1
+else
+  INCLUDE_ASSETS=0
+fi
+
 # --- Validate S3 env (only when NOT dry-run) ---
 if [ "$DRY" -eq 0 ]; then
-  [ -n "${S3_ACCESS_KEY_ID:-}" ]   || { echo "Need S3_ACCESS_KEY_ID"; exit 1; }
+  [ -n "${S3_ACCESS_KEY_ID:-}" ]     || { echo "Need S3_ACCESS_KEY_ID"; exit 1; }
   [ -n "${S3_SECRET_ACCESS_KEY:-}" ] || { echo "Need S3_SECRET_ACCESS_KEY"; exit 1; }
-  [ -n "${S3_BUCKET:-}" ]          || { echo "Need S3_BUCKET"; exit 1; }
+  [ -n "${S3_BUCKET:-}" ]            || { echo "Need S3_BUCKET"; exit 1; }
 fi
 
 # At least one source
@@ -76,6 +84,16 @@ is_ext_ok() {
   return 1
 }
 
+# Is path under the configured root dir?
+is_under_root() {
+  [ -n "${SQLITE_DB_ROOT_DIR:-}" ] || return 1
+  ROOT_NORM="${SQLITE_DB_ROOT_DIR%/}"
+  case "$1" in
+    "$ROOT_NORM"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Preserve structure helper (relative path under root dir if provided)
 rel_key_for() {
   _p="$1"
@@ -84,6 +102,18 @@ rel_key_for() {
     case "$_p" in "$ROOT_NORM"/*) printf '%s' "${_p#${ROOT_NORM}/}"; return 0 ;; esac
   fi
   basename "$_p"
+}
+
+# Ensure bucket exists (best-effort)
+ensure_bucket() {
+  [ "$DRY" -eq 1 ] && return 0
+  if ! aws $AWS_ARGS s3api head-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1; then
+    if [ -n "${S3_REGION:-}" ] && [ "${S3_REGION}" != "us-east-1" ]; then
+      aws $AWS_ARGS s3api create-bucket --bucket "$S3_BUCKET" --create-bucket-configuration LocationConstraint="$S3_REGION" >/dev/null 2>&1 || true
+    else
+      aws $AWS_ARGS s3api create-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 # --- Gather candidate files ---
@@ -128,6 +158,7 @@ echo "Sources:"
 printf '%s\n' "$CANDIDATES_SORTED" | sed 's/^/  - /'
 [ -z "$CANDIDATES_SORTED" ] && { echo "No files found to back up."; exit 0; }
 [ "$DRY" -eq 1 ] && echo "DRY-RUN: validation only; no dump/compress/encrypt/upload/retention."
+[ "$INCLUDE_ASSETS" -eq 1 ] && echo "ASSETS: non-SQLite/filtered files under root will be included."
 
 # --- Summary accumulators ---
 count_ok=0;      list_ok=""
@@ -135,6 +166,79 @@ count_ext=0;     list_ext=""
 count_nosql=0;   list_nosql=""
 count_missing=0; list_missing=""
 count_fail=0;    list_fail=""
+count_asset=0;   list_asset=""
+
+# Upload helper (common to DB and assets)
+upload_file_to_s3() {
+  LOCAL_FILE="$1"
+  DEST_KEY="$2"
+  ensure_bucket
+  if [ "$DRY" -eq 1 ]; then
+    echo "   DRY-RUN Upload -> s3://${S3_BUCKET}/${DEST_KEY}"
+    return 0
+  fi
+  echo "   Upload -> s3://${S3_BUCKET}/${DEST_KEY}"
+  cat "$LOCAL_FILE" | aws $AWS_ARGS s3 cp - "s3://${S3_BUCKET}/${DEST_KEY}"
+}
+
+# Asset backup: copy file as-is (with optional compression/encryption)
+backup_asset() {
+  SRC_PATH="$1"
+  REASON="$2"  # "ext filter" | "not SQLite"
+  DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
+
+  if [ "$DRY" -eq 1 ]; then
+    _k="$DEST_KEY_BASE"
+    [ -n "${COMPRESSION_CMD:-}" ] && _k="${_k}.gz"
+    [ -n "${ENCRYPTION_PASSWORD:-}" ] && _k="${_k}.enc"
+    echo "ASSET (${REASON}): $SRC_PATH"
+    echo "   DRY-RUN -> s3://${S3_BUCKET}/${RUN_PREFIX%/}/${_k}"
+    count_asset=$((count_asset+1)); list_asset="${list_asset}${_k}\n"
+    return 0
+  fi
+
+  TMP_ASSET="/tmp/asset.$(basename "$SRC_PATH")"
+  OUT_FILE="$TMP_ASSET"
+  # If compression is enabled, compress from source into tmp; else copy
+  if [ -n "${COMPRESSION_CMD:-}" ]; then
+    OUT_FILE="${TMP_ASSET}.gz"
+    # shellcheck disable=SC2086
+    if ! $COMPRESSION_CMD < "$SRC_PATH" > "$OUT_FILE"; then
+      echo "FAIL (asset compress): $SRC_PATH"
+      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
+      rm -f "$TMP_ASSET" "$OUT_FILE" 2>/dev/null || true
+      return 1
+    fi
+    DEST_KEY_BASE="${DEST_KEY_BASE}.gz"
+  else
+    cp -f "$SRC_PATH" "$OUT_FILE"
+  fi
+
+  if [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
+    if ! openssl enc -aes-256-cbc -in "$OUT_FILE" -out "${OUT_FILE}.enc" -k "$ENCRYPTION_PASSWORD"; then
+      echo "FAIL (asset encrypt): $SRC_PATH"
+      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
+      rm -f "$OUT_FILE" 2>/dev/null || true
+      return 1
+    fi
+    rm -f "$OUT_FILE"
+    OUT_FILE="${OUT_FILE}.enc"
+    DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
+  fi
+
+  OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
+  if upload_file_to_s3 "$OUT_FILE" "$OBJ_KEY"; then
+    rm -f "$OUT_FILE" "$TMP_ASSET" 2>/dev/null || true
+    echo "   ASSET OK"
+    count_asset=$((count_asset+1)); list_asset="${list_asset}${DEST_KEY_BASE}\n"
+    return 0
+  else
+    echo "FAIL (asset upload): $SRC_PATH"
+    count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
+    rm -f "$OUT_FILE" "$TMP_ASSET" 2>/dev/null || true
+    return 1
+  fi
+}
 
 backup_one() {
   SRC_PATH="$1"
@@ -146,35 +250,45 @@ backup_one() {
     return 1
   fi
 
+  # Extension filter
   if ! is_ext_ok "$SRC_PATH"; then
+    if [ "$INCLUDE_ASSETS" -eq 1 ] && is_under_root "$SRC_PATH"; then
+      echo "ASSET (ext filter): $SRC_PATH"
+      backup_asset "$SRC_PATH" "ext filter" || true
+      return 0
+    fi
     echo "SKIP (ext filter): $SRC_PATH"
     count_ext=$((count_ext+1)); list_ext="${list_ext}$(rel_key_for "$SRC_PATH")\n"
     return 0
   fi
 
+  # SQLite validation
   if ! is_sqlite_file "$SRC_PATH"; then
+    if [ "$INCLUDE_ASSETS" -eq 1 ] && is_under_root "$SRC_PATH"; then
+      echo "ASSET (not SQLite): $SRC_PATH"
+      backup_asset "$SRC_PATH" "not SQLite" || true
+      return 0
+    fi
     echo "SKIP (not SQLite): $SRC_PATH"
     count_nosql=$((count_nosql+1)); list_nosql="${list_nosql}$(rel_key_for "$SRC_PATH")\n"
     return 1
   fi
 
-  DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
-
-  if [ "$DRY" -eq 1 ]; then
-    # Predict resulting object name
-    _k="$DEST_KEY_BASE"
-    [ -n "${COMPRESSION_CMD:-}" ] && _k="${_k}.gz"
-    [ -n "${ENCRYPTION_PASSWORD:-}" ] && _k="${_k}.enc"
-    echo "→ DRY-RUN: would BACKUP: $SRC_PATH"
-    echo "           would Upload -> s3://${S3_BUCKET}/${RUN_PREFIX%/}/${_k}"
-    count_ok=$((count_ok+1)); list_ok="${list_ok}${_k}\n"
-    return 0
-  fi
-
-  # --- Real backup path below ---
+  # --- Real SQLite DB backup ---
   DB_BASENAME="$(basename "$SRC_PATH")"
   TMP_FILE="/tmp/${DB_BASENAME}.bak"
   OUT_FILE="$TMP_FILE"
+  DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
+
+  if [ "$DRY" -eq 1 ]; then
+    k="$DEST_KEY_BASE"
+    [ -n "${COMPRESSION_CMD:-}" ] && k="${k}.gz"
+    [ -n "${ENCRYPTION_PASSWORD:-}" ] && k="${k}.enc"
+    echo "→ DRY-RUN: would BACKUP: $SRC_PATH"
+    echo "           would Upload -> s3://${S3_BUCKET}/${RUN_PREFIX%/}/${k}"
+    count_ok=$((count_ok+1)); list_ok="${list_ok}${k}\n"
+    return 0
+  fi
 
   echo "→ BACKUP: $SRC_PATH"
   if ! sqlite3 "$SRC_PATH" ".backup '${TMP_FILE}'"; then
@@ -206,27 +320,17 @@ backup_one() {
     DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
   fi
 
-  # Ensure bucket exists (best-effort)
-  if ! aws $AWS_ARGS s3api head-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1; then
-    if [ -n "${S3_REGION:-}" ] && [ "${S3_REGION}" != "us-east-1" ]; then
-      aws $AWS_ARGS s3api create-bucket --bucket "$S3_BUCKET" --create-bucket-configuration LocationConstraint="$S3_REGION" >/dev/null 2>&1 || true
-    else
-      aws $AWS_ARGS s3api create-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1 || true
-    fi
-  fi
-
   OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
-  echo "   Upload -> s3://${S3_BUCKET}/${OBJ_KEY}"
-  if ! cat "$OUT_FILE" | aws $AWS_ARGS s3 cp - "s3://${S3_BUCKET}/${OBJ_KEY}"; then
+  if upload_file_to_s3 "$OUT_FILE" "$OBJ_KEY"; then
+    rm -f "$OUT_FILE"
+    echo "   OK"
+    count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_KEY_BASE}\n"
+    return 0
+  else
     echo "FAIL (upload): $SRC_PATH"
     count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
     rm -f "$OUT_FILE"; return 1
   fi
-
-  rm -f "$OUT_FILE"
-  echo "   OK"
-  count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_KEY_BASE}\n"
-  return 0
 }
 
 # --- Iterate without subshell so counters persist ---
@@ -262,11 +366,12 @@ fi
 
 # --- Summary ---
 [ "$DRY" -eq 1 ] && echo "----- DRY-RUN SUMMARY -----" || echo "----- SUMMARY -----"
-echo "Backed up : $count_ok";      [ "$count_ok"      -gt 0 ] && printf "%b" "$list_ok"
-echo "Skipped (ext filter): $count_ext"; [ "$count_ext" -gt 0 ] && printf "%b" "$list_ext"
-echo "Skipped (not SQLite): $count_nosql"; [ "$count_nosql" -gt 0 ] && printf "%b" "$list_nosql"
-echo "Missing   : $count_missing"; [ "$count_missing" -gt 0 ] && printf "%b" "$list_missing"
-echo "Failed    : $count_fail";    [ "$count_fail"    -gt 0 ] && printf "%b" "$list_fail"
+echo "Backed up (SQLite) : $count_ok";     [ "$count_ok"      -gt 0 ] && printf "%b" "$list_ok"
+echo "Included assets    : $count_asset";  [ "$count_asset"   -gt 0 ] && printf "%b" "$list_asset"
+echo "Skipped (ext)      : $count_ext";    [ "$count_ext"     -gt 0 ] && printf "%b" "$list_ext"
+echo "Skipped (not SQL)  : $count_nosql";  [ "$count_nosql"   -gt 0 ] && printf "%b" "$list_nosql"
+echo "Missing            : $count_missing";[ "$count_missing" -gt 0 ] && printf "%b" "$list_missing"
+echo "Failed             : $count_fail";   [ "$count_fail"    -gt 0 ] && printf "%b" "$list_fail"
 echo "-------------------"
 
 # --- Exit with correct status ---

@@ -26,6 +26,7 @@ COPY --from=build /app/out/go-cron /usr/local/bin/go-cron
 ENV SQLITE_DB_PATHS ""
 ENV SQLITE_DB_ROOT_DIR ""
 ENV INCLUDE_SUB_DIR "no"
+ENV INCLUDE_NON_SQL_ASSETS "no"
 ENV SQLITE_EXTS ""
 ENV DRY_RUN "no"
 
