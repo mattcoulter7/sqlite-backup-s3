@@ -17,7 +17,8 @@ services:
       dockerfile: Dockerfile # adjust if your file name differs
     environment:
       # SQLite source
-      SQLITE_DB_PATH: /data/test.sqlite
+      # SQLITE_DB_PATH: /data/test-1.sqlite
+      SQLITE_DB_PATH: "/data/test-1.sqlite;/data/test-2.sqlite"
 
       # S3 / MinIO
       S3_ACCESS_KEY_ID: minio
