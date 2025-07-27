@@ -11,21 +11,6 @@ services:
     volumes:
       - minio-data:/data
 
-  mc-init:
-    image: minio/mc:latest
-    depends_on:
-      - minio
-    entrypoint: /bin/sh
-    command: |
-      set -eu
-      # wait for MinIO API to be ready
-      until mc alias set local http://minio:9000 minio miniosecret >/dev/null 2>&1; do
-        echo "Waiting for MinIO..."
-        sleep 2
-      done
-      mc mb -p local/app-backups || true
-      echo "Bucket app-backups is ready."
-
   sqlite-backup:
     build:
       context: ..            # build from parent directory
@@ -55,7 +40,6 @@ services:
       - ./data:/data:ro          # place test.sqlite in ./data
     depends_on:
       - minio
-      - mc-init
 
 volumes:
   minio-data:
