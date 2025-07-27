@@ -24,6 +24,7 @@ services:
       #   /data/test-2.sql
 
       # (B) Directory scan
+      DRY_RUN: no
       SQLITE_DB_ROOT_DIR: /data
       INCLUDE_SUB_DIR: "yes"                 # yes|true|1 to recurse, else top-level only
       SQLITE_EXTS: "sqlite,db,sqlite3,sq3"  # optional; defaults shown
