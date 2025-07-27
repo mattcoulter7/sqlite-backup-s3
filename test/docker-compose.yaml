@@ -1,0 +1,61 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server --address :9000 --console-address :9001 /data
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO Console
+    volumes:
+      - minio-data:/data
+
+  mc-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: /bin/sh
+    command: |
+      set -eu
+      # wait for MinIO API to be ready
+      until mc alias set local http://minio:9000 minio miniosecret >/dev/null 2>&1; do
+        echo "Waiting for MinIO..."
+        sleep 2
+      done
+      mc mb -p local/app-backups || true
+      echo "Bucket app-backups is ready."
+
+  sqlite-backup:
+    build:
+      context: ..            # build from parent directory
+      dockerfile: Dockerfile # adjust if your file name differs
+    environment:
+      # SQLite source
+      SQLITE_DB_PATH: /data/test.sqlite
+
+      # S3 / MinIO
+      S3_ACCESS_KEY_ID: minio
+      S3_SECRET_ACCESS_KEY: miniosecret
+      S3_BUCKET: app-backups
+      S3_PREFIX: sqlite
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_S3V4: "yes"
+
+      # Schedule & timezone
+      SCHEDULE: "* * * * *"          # every minute for testing; switch to "@daily" later
+      TZ: Australia/Melbourne
+
+      # Compression (optional override)
+      # COMPRESSION_CMD: "gzip -c"
+      # ENCRYPTION_PASSWORD: "changeme"   # optional
+      # DELETE_OLDER_THAN: "14 days ago"  # optional
+    volumes:
+      - ./data:/data:ro          # place test.sqlite in ./data
+    depends_on:
+      - minio
+      - mc-init
+
+volumes:
+  minio-data:
