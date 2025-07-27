@@ -1,151 +1,197 @@
-# postgres-backup-s3
+# sqlite-backup-s3
 
-Backup and restore PostgreSQL to/from S3 (supports periodic backups and encryption)
+Backup a SQLite database file to S3-compatible storage (supports periodic backups, compression, encryption, and retention policies).
+
+> ⚠️ This service **only handles periodic backups** — restore must be done manually.
+>
+> 🏷️ **Credits**: This script is adapted from the excellent [`itbm/postgresql-backup-s3`](https://github.com/itbm/postgresql-backup-s3) repository.
+
+---
 
 ## Basic Usage
 
 ### Backup
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e S3_PREFIX=backup -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost itbm/postgres-backup-s3
+docker run \
+  -e S3_ACCESS_KEY_ID=key \
+  -e S3_SECRET_ACCESS_KEY=secret \
+  -e S3_BUCKET=my-bucket \
+  -e S3_PREFIX=backup \
+  -e SQLITE_DB_PATH=/data/my_database.sq3 \
+  -v /your/db/folder:/data \
+  your-image:tag
 ```
 
-### Restore
+This will create a safe `.backup` of the SQLite database using:
 
 ```sh
-$ docker run -e S3_ACCESS_KEY_ID=key -e S3_SECRET_ACCESS_KEY=secret -e S3_BUCKET=my-bucket -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.sql.gz -e POSTGRES_DATABASE=dbname -e POSTGRES_USER=user -e POSTGRES_PASSWORD=password -e POSTGRES_HOST=localhost -e CREATE_DATABASE=yes itbm/postgres-backup-s3
+sqlite3 /data/my_database.sq3 ".backup '/tmp/backup_timestamped.sq3'"
 ```
 
-Note: When `BACKUP_FILE` is provided, the container automatically runs the restore process instead of backup.
+The backup will be compressed (default: `gzip`), optionally encrypted, and uploaded to your S3-compatible bucket.
+
+---
 
 ## Kubernetes Deployment
 
-```
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: backup
-
----
+```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: postgresql
+  name: sqlite-backup
   namespace: backup
 spec:
   selector:
     matchLabels:
-      app: postgresql
-  strategy:
-    type: Recreate
+      app: sqlite-backup
   template:
     metadata:
       labels:
-        app: postgresql
+        app: sqlite-backup
     spec:
       containers:
-      - name: postgresql
-        image: itbm/postgresql-backup-s3
+      - name: sqlite-backup
+        image: mattcouulter7/sqlite-backup-s3
         imagePullPolicy: Always
         env:
-        - name: POSTGRES_DATABASE
-          value: ""
-        - name: POSTGRES_HOST
-          value: ""
-        - name: POSTGRES_PORT
-          value: ""
-        - name: POSTGRES_PASSWORD
-          value: ""
-        - name: POSTGRES_USER
-          value: ""
+        - name: SQLITE_DB_PATH
+          value: /mnt/data/jellyfin.db
         - name: S3_ACCESS_KEY_ID
-          value: ""
+          value: minio
         - name: S3_SECRET_ACCESS_KEY
-          value: ""
+          value: miniosecret
         - name: S3_BUCKET
-          value: ""
-        - name: S3_ENDPOINT
-          value: ""
+          value: app-backups
         - name: S3_PREFIX
-          value: ""
+          value: jellyfin
+        - name: S3_ENDPOINT
+          value: http://minio.default.svc.cluster.local:9000
         - name: SCHEDULE
-          value: ""
+          value: "@daily"
+        volumeMounts:
+        - name: sqlite-data
+          mountPath: /mnt/data
+          readOnly: true
+      volumes:
+      - name: sqlite-data
+        persistentVolumeClaim:
+          claimName: jellyfin-config
 ```
 
-## Environment variables
+---
 
-| Variable             | Default   | Required | Description                                                                                                              |
-|----------------------|-----------|----------|--------------------------------------------------------------------------------------------------------------------------|
-| POSTGRES_DATABASE    |           | Y        | Database you want to backup/restore or 'all' to backup/restore everything                                               |
-| POSTGRES_HOST        |           | Y        | The PostgreSQL host                                                                                                      |
-| POSTGRES_PORT        | 5432      |          | The PostgreSQL port                                                                                                      |
-| POSTGRES_USER        |           | Y        | The PostgreSQL user                                                                                                      |
-| POSTGRES_PASSWORD    |           | Y        | The PostgreSQL password                                                                                                  |
-| POSTGRES_EXTRA_OPTS  |           |          | Extra postgresql options                                                                                                 |
-| S3_ACCESS_KEY_ID     |           | Y        | Your AWS access key                                                                                                      |
-| S3_SECRET_ACCESS_KEY |           | Y        | Your AWS secret key                                                                                                      |
-| S3_BUCKET            |           | Y        | Your AWS S3 bucket path                                                                                                  |
-| S3_PREFIX            | backup    |          | Path prefix in your bucket                                                                                               |
-| S3_REGION            | us-west-1 |          | The AWS S3 bucket region                                                                                                 |
-| S3_ENDPOINT          |           |          | The AWS Endpoint URL, for S3 Compliant APIs such as [minio](https://minio.io)                                            |
-| S3_S3V4              | no        |          | Set to `yes` to enable AWS Signature Version 4, required for [minio](https://minio.io) servers                           |
-| SCHEDULE             |           |          | Backup schedule time, see explainatons below                                                                             |
-| ENCRYPTION_PASSWORD  |           |          | Password to encrypt/decrypt the backup                                                                                   |
-| DELETE_OLDER_THAN    |           |          | Delete old backups, see explanation and warning below                                                                    |
-| USE_CUSTOM_FORMAT    | no        |          | Use PostgreSQL's custom format (-Fc) instead of plain text with compression                                              |
-| COMPRESSION_CMD      | gzip      |          | Command used to compress the backup (e.g. `pigz` for parallel compression) - ignored when USE_CUSTOM_FORMAT=yes          |
-| DECOMPRESSION_CMD    | gunzip -c |          | Command used to decompress the backup (e.g. `pigz -dc` for parallel decompression) - ignored when USE_CUSTOM_FORMAT=yes  |
-| PARALLEL_JOBS        | 1         |          | Number of parallel jobs for pg_restore when using custom format backups                                                  |
-| BACKUP_FILE          |           | Y*       | Required for restore. The path to the backup file in S3, format: S3_PREFIX/filename                                      |
-| CREATE_DATABASE      | no        |          | For restore: Set to `yes` to create the database if it doesn't exist                                                     |
-| DROP_DATABASE        | no        |          | For restore: Set to `yes` to drop the database before restoring (caution: destroys existing data). Use with CREATE_DATABASE=yes to recreate it |
+## Environment Variables
 
-### Automatic Periodic Backups
+| Variable               | Default     | Required | Description                                                        |
+| ---------------------- | ----------- | -------- | ------------------------------------------------------------------ |
+| `SQLITE_DB_PATH`       |             | ✅        | Full path to the SQLite `.db` file to back up                      |
+| `S3_ACCESS_KEY_ID`     |             | ✅        | Your S3 access key                                                 |
+| `S3_SECRET_ACCESS_KEY` |             | ✅        | Your S3 secret key                                                 |
+| `S3_BUCKET`            |             | ✅        | Destination bucket                                                 |
+| `S3_PREFIX`            | `backup`    |          | Key prefix/folder inside the bucket                                |
+| `S3_ENDPOINT`          |             |          | Custom endpoint for S3-compatible APIs (e.g. MinIO)                |
+| `S3_REGION`            | `us-west-1` |          | Region for AWS                                                     |
+| `S3_S3V4`              | `no`        |          | Set to `yes` for S3 Signature Version 4 (e.g. MinIO)               |
+| `SCHEDULE`             |             | ✅        | Cron format schedule (e.g. `@daily`, `0 2 * * *`)                  |
+| `ENCRYPTION_PASSWORD`  |             |          | If set, encrypts backup with AES-256-CBC                           |
+| `DELETE_OLDER_THAN`    |             |          | Delete backups older than this duration (e.g. `14 days ago`)       |
+| `COMPRESSION_CMD`      | `gzip -c`   |          | Compression tool (e.g. `xz -c`, or leave empty for no compression) |
 
-You can additionally set the `SCHEDULE` environment variable like `-e SCHEDULE="@daily"` to run the backup automatically.
+---
 
-More information about the scheduling can be found [here](http://godoc.org/github.com/robfig/cron#hdr-Predefined_schedules).
+## Periodic Backups
 
-### Delete Old Backups
-
-You can additionally set the `DELETE_OLDER_THAN` environment variable like `-e DELETE_OLDER_THAN="30 days ago"` to delete old backups.
-
-WARNING: this will delete all files in the S3_PREFIX path, not just those created by this script.
-
-### Encryption
-
-You can additionally set the `ENCRYPTION_PASSWORD` environment variable like `-e ENCRYPTION_PASSWORD="superstrongpassword"` to encrypt the backup. The restore process will automatically detect encrypted backups and decrypt them when the `ENCRYPTION_PASSWORD` environment variable is set correctly. It can be manually decrypted using `openssl aes-256-cbc -d -in backup.sql.gz.enc -out backup.sql.gz`.
-
-### Backup Format and Compression Options
-
-There are two options for backup format:
-
-1. **Plain text format with compression** (default):
-   - Uses plain SQL text output compressed with gzip/pigz
-   - Standard and widely compatible
-
-2. **PostgreSQL custom format**:
-   - Enable with `-e USE_CUSTOM_FORMAT=yes`
-   - Significantly faster than plain text format
-   - Produces smaller backup files (built-in compression)
-   - Supports parallel restoration for faster restores
-   - Allows selective table/schema restoration
-   - Recommended for larger databases
-
-For plain text format, backups are compressed with `gzip` by default. For improved performance on multi-core systems, you can use `pigz` (parallel gzip) instead:
+The container will automatically run the backup at the schedule set in `SCHEDULE`, e.g.:
 
 ```sh
-$ docker run ... -e COMPRESSION_CMD=pigz ... itbm/postgres-backup-s3
-
-$ docker run ... -e DECOMPRESSION_CMD="pigz -dc" ... itbm/postgres-backup-s3
+-e SCHEDULE="@daily"
 ```
 
-When using custom format with parallel restore:
+Uses [robfig/cron](https://pkg.go.dev/github.com/robfig/cron) format.
+
+---
+
+## Retention Policy
+
+Optionally clean up older backups:
 
 ```sh
-$ docker run ... -e USE_CUSTOM_FORMAT=yes ... itbm/postgres-backup-s3
-
-$ docker run ... -e PARALLEL_JOBS=4 -e BACKUP_FILE=backup/dbname_0000-00-00T00:00:00Z.dump ... itbm/postgres-backup-s3
+-e DELETE_OLDER_THAN="30 days ago"
 ```
 
-Note: Custom format is not available when using `POSTGRES_DATABASE=all` as pg_dumpall does not support this format.
+⚠️ **Warning**: this deletes *any* object in the specified `S3_PREFIX`.
+
+---
+
+## Encryption
+
+You can encrypt your backups with:
+
+```sh
+-e ENCRYPTION_PASSWORD="mysupersecret"
+```
+
+They’ll be saved with `.enc` suffix. Decrypt manually with:
+
+```sh
+openssl aes-256-cbc -d -in backup.sqlite.gz.enc -out backup.sqlite.gz
+```
+
+---
+
+## Compression
+
+By default, backups are compressed with `gzip -c`.
+
+You can override this with:
+
+```sh
+-e COMPRESSION_CMD="xz -c"
+```
+
+To disable compression:
+
+```sh
+-e COMPRESSION_CMD=""
+```
+
+---
+
+## Local Test
+
+```shell
+cd test
+docker compose up --build
+```
+
+
+The first time it runs, you should see an output like
+
+```shell
+sqlite-backup-1  | [2025-07-27 14:01:50] INFO: Cron job scheduled: * * * * *
+sqlite-backup-1  | [2025-07-27 14:01:50] INFO: Command to run: /bin/sh backup.sh
+sqlite-backup-1  | [2025-07-27 14:02:00] INFO: Executing command: /bin/sh [backup.sh]                                                                                             
+sqlite-backup-1  | [2025-07-27 14:02:00] STDERR: -----
+sqlite-backup-1  | [2025-07-27 14:02:00] STDOUT: Creating SQLite backup of /data/test.sqlite...                                                                                   
+sqlite-backup-1  | [2025-07-27 14:02:00] STDOUT: Compressing backup (gzip -c)...                                                                                                  
+sqlite-backup-1  | [2025-07-27 14:02:00] STDOUT: Uploading backup to s3://app-backups/sqlite/test_2025-07-27T04:02:00Z.sqlite.gz
+sqlite-backup-1  | [2025-07-27 14:02:00] STDERR: upload failed: - to s3://app-backups/sqlite/test_2025-07-27T04:02:00Z.sqlite.gz An error occurred (NoSuchBucket) when calling the PutObject operation: The specified bucket does not exist
+```
+
+Manually create the bucket `app-backups` in `localhost:9001`
+
+On the next run you should see
+
+```
+sqlite-backup-1  | [2025-07-27 14:10:22] INFO: Cron job scheduled: * * * * *
+sqlite-backup-1  | [2025-07-27 14:10:22] INFO: Command to run: /bin/sh backup.sh
+sqlite-backup-1  | [2025-07-27 14:11:00] INFO: Executing command: /bin/sh [backup.sh]
+sqlite-backup-1  | [2025-07-27 14:11:00] STDERR: -----
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: Creating SQLite backup of /data/test.sqlite...                                                                                   
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: Compressing backup (gzip -c)...                                                                                                  
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: Uploading backup to s3://app-backups/sqlite/test_2025-07-27T04:11:00Z.sqlite.gz
+sqlite-backup-1  | [2025-07-27 14:11:00] STDERR: -----                                                                                                                            
+sqlite-backup-1  | [2025-07-27 14:11:00] STDOUT: SQLite backup finished
+sqlite-backup-1  | [2025-07-27 14:11:00] INFO: Command finished successfully
+```
