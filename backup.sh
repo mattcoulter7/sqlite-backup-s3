@@ -1,7 +1,11 @@
 #! /bin/sh
-# SQLite -> S3 backup: explicit files and/or directory scan, preserves structure under timestamped folder
-# DRY_RUN: set to yes/true/1 to only plan & validate (no backup, no upload, no retention)
-# INCLUDE_NON_SQL_ASSETS: yes|true|1 to also back up non-SQLite/filtered files under SQLITE_DB_ROOT_DIR as "assets"
+# SQLite -> S3 backup: explicit files and/or directory scan, preserves structure
+# Supports:
+# - DRY_RUN: yes|true|1 (plan only)
+# - INCLUDE_NON_SQL_ASSETS: yes|true|1 (include non-SQL files under root as "assets")
+# - BUNDLE_ARCHIVE: yes|true|1 (default yes) -> upload single archive per run
+# - ARCHIVE_FORMAT: tar.gz (default) | zip
+# - ARCHIVE_EXT: override suffix (e.g., "gz" to get {ts}.gz while still tar+gz inside)
 
 set -e
 (set -o pipefail) 2>/dev/null || true
@@ -11,19 +15,17 @@ elog() { >&2 echo "$@"; }
 
 elog "-----"
 
-# --- DRY-RUN toggle (explicit only) ---
-if printf '%s' "${DRY_RUN:-}" | tr '[:upper:]' '[:lower:]' | grep -Eq '^(yes|true|1)$'; then
-  DRY=1
-else
-  DRY=0
-fi
+to_bool() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | grep -Eq '^(yes|true|1)$'
+}
 
-# --- Include assets toggle ---
-if printf '%s' "${INCLUDE_NON_SQL_ASSETS:-}" | tr '[:upper:]' '[:lower:]' | grep -Eq '^(yes|true|1)$'; then
-  INCLUDE_ASSETS=1
-else
-  INCLUDE_ASSETS=0
-fi
+# --- Toggles ---
+if to_bool "${DRY_RUN:-}"; then DRY=1; else DRY=0; fi
+if to_bool "${INCLUDE_NON_SQL_ASSETS:-}"; then INCLUDE_ASSETS=1; else INCLUDE_ASSETS=0; fi
+# Default BUNDLE_ARCHIVE to yes
+if [ -z "${BUNDLE_ARCHIVE:-}" ] || to_bool "${BUNDLE_ARCHIVE:-yes}"; then BUNDLE=1; else BUNDLE=0; fi
+ARCHIVE_FORMAT="${ARCHIVE_FORMAT:-tar.gz}"   # tar.gz | zip
+ARCHIVE_EXT="${ARCHIVE_EXT:-}"               # optional override of suffix
 
 # --- Validate S3 env (only when NOT dry-run) ---
 if [ "$DRY" -eq 0 ]; then
@@ -46,13 +48,24 @@ export AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:-}"
 export AWS_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-}"
 export AWS_DEFAULT_REGION="${S3_REGION:-}"
 
-# Default compression (to stdout)
+# Default compression for per-file mode (ignored in archive mode)
 [ -n "${COMPRESSION_CMD:-}" ] || COMPRESSION_CMD="gzip -c"
 S3_PREFIX="${S3_PREFIX:-}"
 
 # Timestamped folder once per run (use '-' instead of ':' in time)
 RUN_TS="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
 [ -n "${S3_PREFIX}" ] && RUN_PREFIX="${S3_PREFIX%/}/${RUN_TS}" || RUN_PREFIX="${RUN_TS}"
+
+# Determine archive suffix
+case "$ARCHIVE_FORMAT" in
+  zip)    DEF_EXT="zip" ;;
+  tar.gz) DEF_EXT="tar.gz" ;;
+  *)      echo "Unsupported ARCHIVE_FORMAT: $ARCHIVE_FORMAT (use tar.gz or zip)"; exit 1 ;;
+esac
+[ -n "$ARCHIVE_EXT" ] && FINAL_EXT="$ARCHIVE_EXT" || FINAL_EXT="$DEF_EXT"
+ARCHIVE_KEY_BASENAME="${RUN_TS}.${FINAL_EXT}"   # e.g., 2025-07-27T05-06-00Z.tar.gz
+ARCHIVE_S3_KEY=""
+STAGE_ROOT=""
 
 # --- Helpers ---
 is_truthy() {
@@ -88,10 +101,7 @@ is_ext_ok() {
 is_under_root() {
   [ -n "${SQLITE_DB_ROOT_DIR:-}" ] || return 1
   ROOT_NORM="${SQLITE_DB_ROOT_DIR%/}"
-  case "$1" in
-    "$ROOT_NORM"/*) return 0 ;;
-    *) return 1 ;;
-  esac
+  case "$1" in "$ROOT_NORM"/*) return 0 ;; *) return 1 ;; esac
 }
 
 # Preserve structure helper (relative path under root dir if provided)
@@ -114,6 +124,19 @@ ensure_bucket() {
       aws $AWS_ARGS s3api create-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1 || true
     fi
   fi
+}
+
+# Upload helper (for per-file or archive)
+upload_bytes_to_s3() {
+  LOCAL_FILE="$1"
+  DEST_KEY="$2"
+  ensure_bucket
+  if [ "$DRY" -eq 1 ]; then
+    echo "   DRY-RUN Upload -> s3://${S3_BUCKET}/${DEST_KEY}"
+    return 0
+  fi
+  echo "   Upload -> s3://${S3_BUCKET}/${DEST_KEY}"
+  cat "$LOCAL_FILE" | aws $AWS_ARGS s3 cp - "s3://${S3_BUCKET}/${DEST_KEY}"
 }
 
 # --- Gather candidate files ---
@@ -153,7 +176,10 @@ fi
 CANDIDATES_SORTED="$(printf '%s\n' "$CANDIDATES_RAW" | sed '/^$/d' | awk '!x[$0]++')"
 
 # --- Plan output ---
+[ "$BUNDLE" -eq 1 ] && MODE_STR="ARCHIVE (one upload)" || MODE_STR="PER-FILE uploads"
+echo "Mode: $MODE_STR"
 echo "Run folder: s3://${S3_BUCKET}/${RUN_PREFIX%/}/"
+[ "$BUNDLE" -eq 1 ] && echo "Archive format: $ARCHIVE_FORMAT  (suffix: .${FINAL_EXT})"
 echo "Sources:"
 printf '%s\n' "$CANDIDATES_SORTED" | sed 's/^/  - /'
 [ -z "$CANDIDATES_SORTED" ] && { echo "No files found to back up."; exit 0; }
@@ -168,132 +194,61 @@ count_missing=0; list_missing=""
 count_fail=0;    list_fail=""
 count_asset=0;   list_asset=""
 
-# Upload helper (common to DB and assets)
-upload_file_to_s3() {
-  LOCAL_FILE="$1"
-  DEST_KEY="$2"
-  ensure_bucket
-  if [ "$DRY" -eq 1 ]; then
-    echo "   DRY-RUN Upload -> s3://${S3_BUCKET}/${DEST_KEY}"
-    return 0
-  fi
-  echo "   Upload -> s3://${S3_BUCKET}/${DEST_KEY}"
-  cat "$LOCAL_FILE" | aws $AWS_ARGS s3 cp - "s3://${S3_BUCKET}/${DEST_KEY}"
+# If bundling, create staging dir
+if [ "$BUNDLE" -eq 1 ]; then
+  STAGE_ROOT="$(mktemp -d /tmp/sqlite-stage.XXXXXX)"
+  [ -n "$STAGE_ROOT" ] || { echo "Failed to create staging directory"; exit 1; }
+  # We will upload to: s3://$S3_BUCKET/${S3_PREFIX%/}/${ARCHIVE_KEY_BASENAME}
+  [ -n "${S3_PREFIX}" ] && ARCHIVE_S3_KEY="${S3_PREFIX%/}/${ARCHIVE_KEY_BASENAME}" || ARCHIVE_S3_KEY="${ARCHIVE_KEY_BASENAME}"
+fi
+
+# Stage helpers (for archive mode)
+stage_put() {
+  SRC="$1"            # local source file (dump or asset)
+  DEST_REL="$2"       # relative path inside archive (preserve structure)
+  DEST_DIR="${STAGE_ROOT%/}/$(dirname "$DEST_REL")"
+  mkdir -p "$DEST_DIR"
+  cp -f "$SRC" "${STAGE_ROOT%/}/$DEST_REL"
 }
 
-# Asset backup: copy file as-is (with optional compression/encryption)
-backup_asset() {
-  SRC_PATH="$1"
-  REASON="$2"  # "ext filter" | "not SQLite"
-  DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
-
-  if [ "$DRY" -eq 1 ]; then
-    _k="$DEST_KEY_BASE"
-    [ -n "${COMPRESSION_CMD:-}" ] && _k="${_k}.gz"
-    [ -n "${ENCRYPTION_PASSWORD:-}" ] && _k="${_k}.enc"
-    echo "ASSET (${REASON}): $SRC_PATH"
-    echo "   DRY-RUN -> s3://${S3_BUCKET}/${RUN_PREFIX%/}/${_k}"
-    count_asset=$((count_asset+1)); list_asset="${list_asset}${_k}\n"
-    return 0
-  fi
-
-  TMP_ASSET="/tmp/asset.$(basename "$SRC_PATH")"
-  OUT_FILE="$TMP_ASSET"
-  # If compression is enabled, compress from source into tmp; else copy
-  if [ -n "${COMPRESSION_CMD:-}" ]; then
-    OUT_FILE="${TMP_ASSET}.gz"
-    # shellcheck disable=SC2086
-    if ! $COMPRESSION_CMD < "$SRC_PATH" > "$OUT_FILE"; then
-      echo "FAIL (asset compress): $SRC_PATH"
-      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
-      rm -f "$TMP_ASSET" "$OUT_FILE" 2>/dev/null || true
-      return 1
-    fi
-    DEST_KEY_BASE="${DEST_KEY_BASE}.gz"
-  else
-    cp -f "$SRC_PATH" "$OUT_FILE"
-  fi
-
-  if [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
-    if ! openssl enc -aes-256-cbc -in "$OUT_FILE" -out "${OUT_FILE}.enc" -k "$ENCRYPTION_PASSWORD"; then
-      echo "FAIL (asset encrypt): $SRC_PATH"
-      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
-      rm -f "$OUT_FILE" 2>/dev/null || true
-      return 1
-    fi
-    rm -f "$OUT_FILE"
-    OUT_FILE="${OUT_FILE}.enc"
-    DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
-  fi
-
-  OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
-  if upload_file_to_s3 "$OUT_FILE" "$OBJ_KEY"; then
-    rm -f "$OUT_FILE" "$TMP_ASSET" 2>/dev/null || true
-    echo "   ASSET OK"
-    count_asset=$((count_asset+1)); list_asset="${list_asset}${DEST_KEY_BASE}\n"
-    return 0
-  else
-    echo "FAIL (asset upload): $SRC_PATH"
-    count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
-    rm -f "$OUT_FILE" "$TMP_ASSET" 2>/dev/null || true
+dump_sqlite_to_path() {
+  SRC_DB="$1"
+  DEST_REL="$2"
+  TMP_FILE="/tmp/.$(basename "$DEST_REL").bak"
+  if ! sqlite3 "$SRC_DB" ".backup '${TMP_FILE}'"; then
     return 1
   fi
+  stage_put "$TMP_FILE" "$DEST_REL"
+  rm -f "$TMP_FILE"
 }
 
-backup_one() {
+# Asset staging (no per-file compression/encryption in archive mode)
+stage_asset() {
   SRC_PATH="$1"
-  [ -n "$SRC_PATH" ] || return 0
+  DEST_REL="$2"
+  stage_put "$SRC_PATH" "$DEST_REL"
+}
 
-  if [ ! -f "$SRC_PATH" ]; then
-    echo "SKIP (missing): $SRC_PATH"
-    count_missing=$((count_missing+1)); list_missing="${list_missing}${SRC_PATH}\n"
-    return 1
-  fi
+# Per-file upload pipeline (when not bundling) -------------
+upload_db_per_file() {
+  SRC_DB="$1"
+  DEST_BASE="$2"   # relative key base in S3 prefix
 
-  # Extension filter
-  if ! is_ext_ok "$SRC_PATH"; then
-    if [ "$INCLUDE_ASSETS" -eq 1 ] && is_under_root "$SRC_PATH"; then
-      echo "ASSET (ext filter): $SRC_PATH"
-      backup_asset "$SRC_PATH" "ext filter" || true
-      return 0
-    fi
-    echo "SKIP (ext filter): $SRC_PATH"
-    count_ext=$((count_ext+1)); list_ext="${list_ext}$(rel_key_for "$SRC_PATH")\n"
-    return 0
-  fi
-
-  # SQLite validation
-  if ! is_sqlite_file "$SRC_PATH"; then
-    if [ "$INCLUDE_ASSETS" -eq 1 ] && is_under_root "$SRC_PATH"; then
-      echo "ASSET (not SQLite): $SRC_PATH"
-      backup_asset "$SRC_PATH" "not SQLite" || true
-      return 0
-    fi
-    echo "SKIP (not SQLite): $SRC_PATH"
-    count_nosql=$((count_nosql+1)); list_nosql="${list_nosql}$(rel_key_for "$SRC_PATH")\n"
-    return 1
-  fi
-
-  # --- Real SQLite DB backup ---
-  DB_BASENAME="$(basename "$SRC_PATH")"
-  TMP_FILE="/tmp/${DB_BASENAME}.bak"
-  OUT_FILE="$TMP_FILE"
-  DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
-
-  if [ "$DRY" -eq 1 ]; then
-    k="$DEST_KEY_BASE"
+  [ "$DRY" -eq 1 ] && {
+    k="$DEST_BASE"
     [ -n "${COMPRESSION_CMD:-}" ] && k="${k}.gz"
     [ -n "${ENCRYPTION_PASSWORD:-}" ] && k="${k}.enc"
-    echo "→ DRY-RUN: would BACKUP: $SRC_PATH"
+    echo "→ DRY-RUN: would BACKUP: $SRC_DB"
     echo "           would Upload -> s3://${S3_BUCKET}/${RUN_PREFIX%/}/${k}"
     count_ok=$((count_ok+1)); list_ok="${list_ok}${k}\n"
     return 0
-  fi
+  }
 
-  echo "→ BACKUP: $SRC_PATH"
-  if ! sqlite3 "$SRC_PATH" ".backup '${TMP_FILE}'"; then
-    echo "FAIL (sqlite backup): $SRC_PATH"
-    count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
+  TMP_FILE="/tmp/$(basename "$DEST_BASE").bak"
+  OUT_FILE="$TMP_FILE"
+  if ! sqlite3 "$SRC_DB" ".backup '${TMP_FILE}'"; then
+    echo "FAIL (sqlite backup): $SRC_DB"
+    count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_BASE}\n"
     rm -f "$TMP_FILE"; return 1
   fi
 
@@ -301,45 +256,219 @@ backup_one() {
     OUT_FILE="${TMP_FILE}.gz"
     # shellcheck disable=SC2086
     if ! $COMPRESSION_CMD < "$TMP_FILE" > "$OUT_FILE"; then
-      echo "FAIL (compress): $SRC_PATH"
-      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
+      echo "FAIL (compress): $SRC_DB"
+      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_BASE}\n"
       rm -f "$TMP_FILE"; return 1
     fi
     rm -f "$TMP_FILE"
-    DEST_KEY_BASE="${DEST_KEY_BASE}.gz"
+    DEST_BASE="${DEST_BASE}.gz"
   fi
 
   if [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
     if ! openssl enc -aes-256-cbc -in "$OUT_FILE" -out "${OUT_FILE}.enc" -k "$ENCRYPTION_PASSWORD"; then
-      echo "FAIL (encrypt): $SRC_PATH"
-      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
+      echo "FAIL (encrypt): $SRC_DB"
+      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_BASE}\n"
       rm -f "$OUT_FILE"; return 1
     fi
     rm -f "$OUT_FILE"
     OUT_FILE="${OUT_FILE}.enc"
-    DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
+    DEST_BASE="${DEST_BASE}.enc"
   fi
 
-  OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
-  if upload_file_to_s3 "$OUT_FILE" "$OBJ_KEY"; then
+  OBJ_KEY="${RUN_PREFIX%/}/${DEST_BASE}"
+  if upload_bytes_to_s3 "$OUT_FILE" "$OBJ_KEY"; then
     rm -f "$OUT_FILE"
     echo "   OK"
-    count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_KEY_BASE}\n"
+    count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_BASE}\n"
     return 0
   else
-    echo "FAIL (upload): $SRC_PATH"
-    count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_KEY_BASE}\n"
+    echo "FAIL (upload): $SRC_DB"
+    count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_BASE}\n"
     rm -f "$OUT_FILE"; return 1
   fi
 }
 
-# --- Iterate without subshell so counters persist ---
-while IFS= read -r item; do
-  [ -n "$item" ] || continue
-  backup_one "$item" || true
+upload_asset_per_file() {
+  SRC_PATH="$1"
+  DEST_BASE="$2"
+
+  [ "$DRY" -eq 1 ] && {
+    k="$DEST_BASE"
+    [ -n "${COMPRESSION_CMD:-}" ] && k="${k}.gz"
+    [ -n "${ENCRYPTION_PASSWORD:-}" ] && k="${k}.enc"
+    echo "ASSET: $SRC_PATH"
+    echo "   DRY-RUN -> s3://${S3_BUCKET}/${RUN_PREFIX%/}/${k}"
+    count_asset=$((count_asset+1)); list_asset="${list_asset}${k}\n"
+    return 0
+  }
+
+  TMP_FILE="/tmp/asset.$(basename "$DEST_BASE")"
+  OUT_FILE="$TMP_FILE"
+  if [ -n "${COMPRESSION_CMD:-}" ]; then
+    OUT_FILE="${TMP_FILE}.gz"
+    # shellcheck disable=SC2086
+    if ! $COMPRESSION_CMD < "$SRC_PATH" > "$OUT_FILE"; then
+      echo "FAIL (asset compress): $SRC_PATH"
+      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_BASE}\n"
+      rm -f "$TMP_FILE" "$OUT_FILE" 2>/dev/null || true
+      return 1
+    fi
+    DEST_BASE="${DEST_BASE}.gz"
+  else
+    cp -f "$SRC_PATH" "$OUT_FILE"
+  fi
+
+  if [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
+    if ! openssl enc -aes-256-cbc -in "$OUT_FILE" -out "${OUT_FILE}.enc" -k "$ENCRYPTION_PASSWORD"; then
+      echo "FAIL (asset encrypt): $SRC_PATH"
+      count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_BASE}\n"
+      rm -f "$OUT_FILE" 2>/dev/null || true
+      return 1
+    fi
+    rm -f "$OUT_FILE"
+    OUT_FILE="${OUT_FILE}.enc"
+    DEST_BASE="${DEST_BASE}.enc"
+  fi
+
+  OBJ_KEY="${RUN_PREFIX%/}/${DEST_BASE}"
+  if upload_bytes_to_s3 "$OUT_FILE" "$OBJ_KEY"; then
+    rm -f "$OUT_FILE" "$TMP_FILE" 2>/dev/null || true
+    echo "   ASSET OK"
+    count_asset=$((count_asset+1)); list_asset="${list_asset}${DEST_BASE}\n"
+    return 0
+  else
+    echo "FAIL (asset upload): $SRC_PATH"
+    count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_BASE}\n"
+    rm -f "$OUT_FILE" "$TMP_FILE" 2>/dev/null || true
+    return 1
+  fi
+}
+
+# --- Main loop over candidates ---
+while IFS= read -r SRC_PATH; do
+  [ -n "$SRC_PATH" ] || continue
+
+  if [ ! -f "$SRC_PATH" ]; then
+    echo "SKIP (missing): $SRC_PATH"
+    count_missing=$((count_missing+1)); list_missing="${list_missing}${SRC_PATH}\n"
+    continue
+  fi
+
+  DEST_REL="$(rel_key_for "$SRC_PATH")"
+
+  # Extension filter
+  if ! is_ext_ok "$SRC_PATH"; then
+    if [ "$INCLUDE_ASSETS" -eq 1 ] && is_under_root "$SRC_PATH"; then
+      echo "ASSET (ext filter): $SRC_PATH"
+      if [ "$BUNDLE" -eq 1 ]; then
+        if [ "$DRY" -eq 1 ]; then
+          echo "   DRY-RUN -> archive add: $DEST_REL"
+          count_asset=$((count_asset+1)); list_asset="${list_asset}${DEST_REL}\n"
+        else
+          stage_asset "$SRC_PATH" "$DEST_REL" || true
+          count_asset=$((count_asset+1)); list_asset="${list_asset}${DEST_REL}\n"
+        fi
+      else
+        upload_asset_per_file "$SRC_PATH" "$DEST_REL" || true
+      fi
+      continue
+    fi
+    echo "SKIP (ext filter): $SRC_PATH"
+    count_ext=$((count_ext+1)); list_ext="${list_ext}${DEST_REL}\n"
+    continue
+  fi
+
+  # SQLite validation
+  if ! is_sqlite_file "$SRC_PATH"; then
+    if [ "$INCLUDE_ASSETS" -eq 1 ] && is_under_root "$SRC_PATH"; then
+      echo "ASSET (not SQLite): $SRC_PATH"
+      if [ "$BUNDLE" -eq 1 ]; then
+        if [ "$DRY" -eq 1 ]; then
+          echo "   DRY-RUN -> archive add: $DEST_REL"
+          count_asset=$((count_asset+1)); list_asset="${list_asset}${DEST_REL}\n"
+        else
+          stage_asset "$SRC_PATH" "$DEST_REL" || true
+          count_asset=$((count_asset+1)); list_asset="${list_asset}${DEST_REL}\n"
+        fi
+      else
+        upload_asset_per_file "$SRC_PATH" "$DEST_REL" || true
+      fi
+      continue
+    fi
+    echo "SKIP (not SQLite): $SRC_PATH"
+    count_nosql=$((count_nosql+1)); list_nosql="${list_nosql}${DEST_REL}\n"
+    continue
+  fi
+
+  # --- Valid SQLite DB ---
+  if [ "$BUNDLE" -eq 1 ]; then
+    if [ "$DRY" -eq 1 ]; then
+      echo "→ DRY-RUN: would dump $SRC_PATH -> archive add: $DEST_REL"
+      count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_REL}\n"
+    else
+      echo "→ DUMP: $SRC_PATH"
+      if dump_sqlite_to_path "$SRC_PATH" "$DEST_REL"; then
+        count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_REL}\n"
+      else
+        echo "FAIL (sqlite backup): $SRC_PATH"
+        count_fail=$((count_fail+1)); list_fail="${list_fail}${DEST_REL}\n"
+      fi
+    fi
+  else
+    upload_db_per_file "$SRC_PATH" "$DEST_REL" || true
+  fi
 done <<EOF
 $CANDIDATES_SORTED
 EOF
+
+# --- If bundling, create archive and upload once ---
+if [ "$BUNDLE" -eq 1 ]; then
+  if [ "$DRY" -eq 1 ]; then
+    echo "DRY-RUN: would create archive from staging and upload once."
+    [ -n "${S3_PREFIX}" ] && ARCHIVE_S3_KEY="${S3_PREFIX%/}/${ARCHIVE_KEY_BASENAME}" || ARCHIVE_S3_KEY="${ARCHIVE_KEY_BASENAME}"
+    echo "DRY-RUN: would upload -> s3://${S3_BUCKET}/${ARCHIVE_S3_KEY}"
+  else
+    # If nothing staged, still create an empty archive to reflect run (optional behavior)
+    ARCHIVE_FILE="/tmp/sqlite-archive.${FINAL_EXT}"
+    case "$ARCHIVE_FORMAT" in
+      tar.gz)
+        # Create tar.gz
+        ( cd "$STAGE_ROOT" && tar -czf "$ARCHIVE_FILE" . ) || { echo "FAIL (archive tar.gz)"; count_fail=$((count_fail+1)); }
+        ;;
+      zip)
+        command -v zip >/dev/null 2>&1 || { echo "zip not installed; set ARCHIVE_FORMAT=tar.gz or add zip to image"; exit 1; }
+        ( cd "$STAGE_ROOT" && zip -r -q "$ARCHIVE_FILE" . ) || { echo "FAIL (archive zip)"; count_fail=$((count_fail+1)); }
+        ;;
+    esac
+
+    # Optional encryption (once for the archive)
+    if [ -n "${ENCRYPTION_PASSWORD:-}" ] && [ -f "$ARCHIVE_FILE" ]; then
+      if ! openssl enc -aes-256-cbc -in "$ARCHIVE_FILE" -out "${ARCHIVE_FILE}.enc" -k "$ENCRYPTION_PASSWORD"; then
+        echo "FAIL (archive encrypt)"
+        count_fail=$((count_fail+1))
+      else
+        rm -f "$ARCHIVE_FILE"
+        ARCHIVE_FILE="${ARCHIVE_FILE}.enc"
+        ARCHIVE_KEY_BASENAME="${ARCHIVE_KEY_BASENAME}.enc"
+      fi
+    fi
+
+    [ -n "${S3_PREFIX}" ] && ARCHIVE_S3_KEY="${S3_PREFIX%/}/${ARCHIVE_KEY_BASENAME}" || ARCHIVE_S3_KEY="${ARCHIVE_KEY_BASENAME}"
+
+    if [ -f "$ARCHIVE_FILE" ]; then
+      if upload_bytes_to_s3 "$ARCHIVE_FILE" "$ARCHIVE_S3_KEY"; then
+        echo "   ARCHIVE OK -> s3://${S3_BUCKET}/${ARCHIVE_S3_KEY}"
+      else
+        echo "FAIL (archive upload)"
+        count_fail=$((count_fail+1))
+      fi
+      rm -f "$ARCHIVE_FILE"
+    fi
+  fi
+
+  # Clean staging
+  [ -n "$STAGE_ROOT" ] && rm -rf "$STAGE_ROOT" || true
+fi
 
 # --- Optional retention (skip in dry-run) ---
 if [ "$DRY" -eq 1 ]; then
@@ -365,17 +494,17 @@ else
 fi
 
 # --- Summary ---
-[ "$DRY" -eq 1 ] && echo "----- DRY-RUN SUMMARY -----" || echo "----- SUMMARY -----"
-echo "Backed up (SQLite) : $count_ok";     [ "$count_ok"      -gt 0 ] && printf "%b" "$list_ok"
-echo "Included assets    : $count_asset";  [ "$count_asset"   -gt 0 ] && printf "%b" "$list_asset"
-echo "Skipped (ext)      : $count_ext";    [ "$count_ext"     -gt 0 ] && printf "%b" "$list_ext"
-echo "Skipped (not SQL)  : $count_nosql";  [ "$count_nosql"   -gt 0 ] && printf "%b" "$list_nosql"
-echo "Missing            : $count_missing";[ "$count_missing" -gt 0 ] && printf "%b" "$list_missing"
-echo "Failed             : $count_fail";   [ "$count_fail"    -gt 0 ] && printf "%b" "$list_fail"
+if [ "$DRY" -eq 1 ]; then echo "----- DRY-RUN SUMMARY -----"; else echo "----- SUMMARY -----"; fi
+echo "Backed up (SQLite) : $count_ok";      [ "$count_ok"      -gt 0 ] && printf "%b" "$list_ok"
+echo "Included assets    : $count_asset";   [ "$count_asset"   -gt 0 ] && printf "%b" "$list_asset"
+echo "Skipped (ext)      : $count_ext";     [ "$count_ext"     -gt 0 ] && printf "%b" "$list_ext"
+echo "Skipped (not SQL)  : $count_nosql";   [ "$count_nosql"   -gt 0 ] && printf "%b" "$list_nosql"
+echo "Missing            : $count_missing"; [ "$count_missing" -gt 0 ] && printf "%b" "$list_missing"
+echo "Failed             : $count_fail";    [ "$count_fail"    -gt 0 ] && printf "%b" "$list_fail"
+if [ "$BUNDLE" -eq 1 ]; then
+  echo "Archive object     : ${ARCHIVE_S3_KEY:-<dry-run>}"
+fi
 echo "-------------------"
 
 # --- Exit with correct status ---
-if [ "$count_fail" -gt 0 ]; then
-  exit 1
-fi
-exit 0
+[ "$count_fail" -gt 0 ] && exit 1 || exit 0

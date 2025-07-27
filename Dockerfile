@@ -15,8 +15,10 @@ RUN go mod init github.com/mattcoulter7/sqlite-backup-s3 \
 FROM alpine:3.22
 LABEL maintainer="mattcoulter7"
 
-# sqlite3 CLI for .backup, aws-cli for S3, openssl for optional encryption, pigz for faster gzip, tzdata for cron TZ if you set TZ
-RUN apk add --no-cache coreutils sqlite aws-cli openssl pigz tzdata \
+# sqlite3 for .backup, aws-cli for S3, openssl for optional encryption,
+# pigz for faster gzip, tzdata for TZ handling, zip for ARCHIVE_FORMAT=zip.
+# (tar is available via BusyBox in Alpine by default)
+RUN apk add --no-cache coreutils sqlite aws-cli openssl pigz tzdata zip \
     && rm -rf /var/cache/apk/*
 
 COPY --from=build /app/out/go-cron /usr/local/bin/go-cron
@@ -40,12 +42,17 @@ ENV S3_ENDPOINT ""
 ENV S3_S3V4 "no"
 ENV AWS_S3_FORCE_PATH_STYLE ""
 
+# Archive bundling (defaults ON with tar.gz)
+ENV BUNDLE_ARCHIVE "yes"
+ENV ARCHIVE_FORMAT "tar.gz"
+ENV ARCHIVE_EXT ""
+
 # Scheduling / security / retention
 ENV SCHEDULE ""
 ENV ENCRYPTION_PASSWORD ""
 ENV DELETE_OLDER_THAN ""
 
-# Compression (default matches script expectation: writes to stdout)
+# Per-file compression (used only when BUNDLE_ARCHIVE=no)
 ENV COMPRESSION_CMD "gzip -c"
 
 # Timezone for cron inside container (optional)
