@@ -1,5 +1,6 @@
 #! /bin/sh
 # SQLite -> S3 backup: explicit files and/or directory scan, preserves structure under timestamped folder
+# DRY_RUN: set to yes/true/1 to only plan & validate (no backup, no upload, no retention)
 
 set -e
 (set -o pipefail) 2>/dev/null || true
@@ -9,10 +10,18 @@ elog() { >&2 echo "$@"; }
 
 elog "-----"
 
-# --- Validate S3 env ---
-[ -n "${S3_ACCESS_KEY_ID:-}" ] && [ "${S3_ACCESS_KEY_ID}" != "**None**" ] || { echo "Need S3_ACCESS_KEY_ID"; exit 1; }
-[ -n "${S3_SECRET_ACCESS_KEY:-}" ] && [ "${S3_SECRET_ACCESS_KEY}" != "**None**" ] || { echo "Need S3_SECRET_ACCESS_KEY"; exit 1; }
-[ -n "${S3_BUCKET:-}" ] && [ "${S3_BUCKET}" != "**None**" ] || { echo "Need S3_BUCKET"; exit 1; }
+# --- Validate S3 env (only strictly needed when not in dry-run) ---
+if [ -z "${DRY_RUN:-}" ] || printf '%s' "$DRY_RUN" | tr '[:upper:]' '[:lower:]' | grep -Eq '^(yes|true|1)$'; then
+  DRY=1
+else
+  DRY=0
+fi
+
+if [ "$DRY" -eq 0 ]; then
+  [ -n "${S3_ACCESS_KEY_ID:-}" ] && [ "${S3_ACCESS_KEY_ID}" != "**None**" ] || { echo "Need S3_ACCESS_KEY_ID"; exit 1; }
+  [ -n "${S3_SECRET_ACCESS_KEY:-}" ] && [ "${S3_SECRET_ACCESS_KEY}" != "**None**" ] || { echo "Need S3_SECRET_ACCESS_KEY"; exit 1; }
+  [ -n "${S3_BUCKET:-}" ] && [ "${S3_BUCKET}" != "**None**" ] || { echo "Need S3_BUCKET"; exit 1; }
+fi
 
 # At least one source
 if [ -z "${SQLITE_DB_PATHS:-}" ] && [ -z "${SQLITE_DB_ROOT_DIR:-}" ]; then
@@ -24,8 +33,8 @@ command -v sqlite3 >/dev/null 2>&1 || { echo "sqlite3 not installed in image"; e
 
 # --- AWS/MinIO config ---
 if [ -z "${S3_ENDPOINT:-}" ] || [ "${S3_ENDPOINT}" = "**None**" ]; then AWS_ARGS=""; else AWS_ARGS="--endpoint-url ${S3_ENDPOINT}"; fi
-export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
-export AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
+export AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:-}"
+export AWS_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-}"
 export AWS_DEFAULT_REGION="${S3_REGION:-}"
 
 # Default compression (to stdout)
@@ -41,14 +50,10 @@ is_truthy() {
   v="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
   [ "$v" = "yes" ] || [ "$v" = "true" ] || [ "$v" = "1" ]
 }
-# First 16 bytes should be "SQLite format 3\0"
-has_sqlite_header() {
-  head -c 16 "$1" 2>/dev/null | grep -q "^SQLite format 3"
-}
+has_sqlite_header() { head -c 16 "$1" 2>/dev/null | grep -q "^SQLite format 3"; }
 # Require BOTH: header AND read-only PRAGMA to succeed
-is_sqlite_file() {
-  has_sqlite_header "$1" && sqlite3 -readonly "$1" "PRAGMA schema_version;" >/dev/null 2>&1
-}
+is_sqlite_file() { has_sqlite_header "$1" && sqlite3 -readonly "$1" "PRAGMA schema_version;" >/dev/null 2>&1; }
+
 # Optional extension filter (unset/empty => no filter)
 EXTS_RAW="${SQLITE_EXTS:-}"
 if [ -n "$EXTS_RAW" ]; then
@@ -69,6 +74,7 @@ is_ext_ok() {
   IFS="$OLDIFS"
   return 1
 }
+
 # Preserve structure helper (relative path under root dir if provided)
 rel_key_for() {
   _p="$1"
@@ -120,6 +126,7 @@ echo "Run folder: s3://${S3_BUCKET}/${RUN_PREFIX%/}/"
 echo "Sources:"
 printf '%s\n' "$CANDIDATES_SORTED" | sed 's/^/  - /'
 [ -z "$CANDIDATES_SORTED" ] && { echo "No files found to back up."; exit 0; }
+[ "$DRY" -eq 1 ] && echo "DRY-RUN: validation only; no dump/compress/encrypt/upload/retention."
 
 # --- Summary accumulators ---
 count_ok=0;      list_ok=""
@@ -150,10 +157,27 @@ backup_one() {
     return 1
   fi
 
+  DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
+  # Predict resulting object name based on env (for dry-run display)
+  if [ -n "${COMPRESSION_CMD:-}" ]; then
+    DEST_KEY_BASE="${DEST_KEY_BASE}.gz"
+  fi
+  if [ "${ENCRYPTION_PASSWORD:-**None**}" != "**None**" ] && [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
+    DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
+  fi
+  OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
+
+  if [ "$DRY" -eq 1 ]; then
+    echo "→ DRY-RUN: would BACKUP: $SRC_PATH"
+    echo "           would Upload -> s3://${S3_BUCKET}/${OBJ_KEY}"
+    count_ok=$((count_ok+1)); list_ok="${list_ok}${DEST_KEY_BASE}\n"
+    return 0
+  fi
+
+  # --- Real backup path below ---
   DB_BASENAME="$(basename "$SRC_PATH")"
   TMP_FILE="/tmp/${DB_BASENAME}.bak"
   OUT_FILE="$TMP_FILE"
-  DEST_KEY_BASE="$(rel_key_for "$SRC_PATH")"
 
   echo "→ BACKUP: $SRC_PATH"
   if ! sqlite3 "$SRC_PATH" ".backup '${TMP_FILE}'"; then
@@ -171,7 +195,6 @@ backup_one() {
       rm -f "$TMP_FILE"; return 1
     fi
     rm -f "$TMP_FILE"
-    DEST_KEY_BASE="${DEST_KEY_BASE}.gz"
   fi
 
   if [ "${ENCRYPTION_PASSWORD:-**None**}" != "**None**" ] && [ -n "${ENCRYPTION_PASSWORD:-}" ]; then
@@ -182,7 +205,6 @@ backup_one() {
     fi
     rm -f "$OUT_FILE"
     OUT_FILE="${OUT_FILE}.enc"
-    DEST_KEY_BASE="${DEST_KEY_BASE}.enc"
   fi
 
   # Ensure bucket exists (best-effort)
@@ -194,7 +216,6 @@ backup_one() {
     fi
   fi
 
-  OBJ_KEY="${RUN_PREFIX%/}/${DEST_KEY_BASE}"
   echo "   Upload -> s3://${S3_BUCKET}/${OBJ_KEY}"
   if ! cat "$OUT_FILE" | aws $AWS_ARGS s3 cp - "s3://${S3_BUCKET}/${OBJ_KEY}"; then
     echo "FAIL (upload): $SRC_PATH"
@@ -216,8 +237,31 @@ done <<EOF
 $CANDIDATES_SORTED
 EOF
 
+# --- Optional retention (skip in dry-run) ---
+if [ "$DRY" -eq 1 ]; then
+  if [ "${DELETE_OLDER_THAN:-**None**}" != "**None**" ] && [ -n "${DELETE_OLDER_THAN:-}" ]; then
+    echo "DRY-RUN: would check/delete objects older than ${DELETE_OLDER_THAN} under s3://${S3_BUCKET}/${S3_PREFIX%/}/"
+  fi
+else
+  if [ "${DELETE_OLDER_THAN:-**None**}" != "**None**" ] && [ -n "${DELETE_OLDER_THAN:-}" ]; then
+    elog "Checking for files older than ${DELETE_OLDER_THAN}"
+    aws $AWS_ARGS s3 ls "s3://${S3_BUCKET}/${S3_PREFIX%/}/" --recursive | while read -r line; do
+      fileName=$(echo "$line" | awk '{print $4}')
+      created=$(echo "$line" | awk '{print $1" "$2}')
+      created=$(date -d "$created" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M" "$created" +%s)
+      older_than=$(date -d "$DELETE_OLDER_THAN" +%s 2>/dev/null || true)
+      if [ -n "$fileName" ] && [ -n "$created" ] && [ -n "$older_than" ] && [ "$created" -lt "$older_than" ]; then
+        elog "DELETING ${fileName}"
+        aws $AWS_ARGS s3 rm "s3://${S3_BUCKET}/${fileName}" || true
+      else
+        elog "${fileName} not older than ${DELETE_OLDER_THAN}"
+      fi
+    done
+  fi
+fi
+
 # --- Summary ---
-echo "----- SUMMARY -----"
+[ "$DRY" -eq 1 ] && echo "----- DRY-RUN SUMMARY -----" || echo "----- SUMMARY -----"
 echo "Backed up : $count_ok";      [ "$count_ok"      -gt 0 ] && printf "%b" "$list_ok"
 echo "Skipped (ext filter): $count_ext"; [ "$count_ext" -gt 0 ] && printf "%b" "$list_ext"
 echo "Skipped (not SQLite): $count_nosql"; [ "$count_nosql" -gt 0 ] && printf "%b" "$list_nosql"
