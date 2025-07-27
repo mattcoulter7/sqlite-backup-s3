@@ -16,29 +16,37 @@ services:
       context: ..            # build from parent directory
       dockerfile: Dockerfile # adjust if your file name differs
     environment:
-      # SQLite source
-      # SQLITE_DB_PATH: /data/test-1.sqlite
-      SQLITE_DB_PATH: "/data/test-1.sqlite;/data/test-2.sqlite"
+      # --- Choose ONE of the following source configs ---
 
-      # S3 / MinIO
+      # (A) Explicit files (semicolon OR newline separated)
+      # SQLITE_DB_PATHS: |
+      #   /data/test-1.sqlite
+      #   /data/test-2.sql
+
+      # (B) Directory scan
+      SQLITE_DB_ROOT_DIR: /data
+      INCLUDE_SUB_DIR: "yes"                 # yes|true|1 to recurse, else top-level only
+      SQLITE_EXTS: "sqlite,db,sqlite3,sq3"  # optional; defaults shown
+
+      # --- S3 / MinIO ---
       S3_ACCESS_KEY_ID: minio
       S3_SECRET_ACCESS_KEY: miniosecret
       S3_BUCKET: app-backups
       S3_PREFIX: sqlite
       S3_ENDPOINT: http://minio:9000
       S3_REGION: us-east-1
-      S3_S3V4: "yes"
+      # S3_S3V4: "yes"                        # optional; MinIO works fine without this for aws-cli
 
-      # Schedule & timezone
-      SCHEDULE: "* * * * *"          # every minute for testing; switch to "@daily" later
+      # --- Schedule & timezone ---
+      SCHEDULE: "* * * * *"                   # every minute for testing; switch to "@daily" later
       TZ: Australia/Melbourne
 
-      # Compression (optional override)
-      # COMPRESSION_CMD: "gzip -c"
-      # ENCRYPTION_PASSWORD: "changeme"   # optional
-      # DELETE_OLDER_THAN: "14 days ago"  # optional
+      # --- Optional extras ---
+      # ENCRYPTION_PASSWORD: "changeme"
+      # DELETE_OLDER_THAN: "14 days ago"
+      # COMPRESSION_CMD: "gzip -c"            # default; set "" to disable compression
     volumes:
-      - ./data:/data:ro          # place test.sqlite in ./data
+      - ./data:/data:ro
     depends_on:
       - minio
 
