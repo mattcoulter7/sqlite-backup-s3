@@ -41,7 +41,7 @@ docker run \
   -e S3_PREFIX=backup \
   -e SQLITE_DB_PATHS=/data/my_database.sqlite \
   -v /your/db/folder:/data:ro \
-  your-image:tag
+  mattcoulter7/sqlite-backup-s3:1.0.3
 ```
 
 This performs:
@@ -63,7 +63,7 @@ docker run \
   -e SQLITE_DB_PATHS="/data/db1.sqlite;/data/db2.sqlite3" \
   -e S3_ENDPOINT=http://minio:9000 \
   -v /host/data:/data:ro \
-  your-image:tag
+  mattcoulter7/sqlite-backup-s3:1.0.3
 ```
 
 ### Directory scan (recursive)
@@ -79,7 +79,7 @@ docker run \
   # -e SQLITE_EXTS="sqlite,sqlite3,db"  # optional; unset => no extension filtering
   -e S3_ENDPOINT=http://minio:9000 \
   -v /host/jellyfin:/data:ro \
-  your-image:tag
+  mattcoulter7/sqlite-backup-s3:1.0.3
 ```
 
 > **Note:** Even if you disable the extension filter, non‑SQLite files are still **skipped** thanks to header + `PRAGMA` validation.
@@ -95,7 +95,7 @@ docker run \
   -e INCLUDE_SUB_DIR=yes \
   -e S3_BUCKET=app-backups -e S3_PREFIX=sqlite \
   -v /host/data:/data:ro \
-  your-image:tag
+  mattcoulter7/sqlite-backup-s3:1.0.3
 ```
 
 ---
